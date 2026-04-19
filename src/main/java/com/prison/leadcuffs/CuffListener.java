@@ -1,18 +1,25 @@
 package com.prison.leadcuffs;
 
+import org.bukkit.Bukkit;
 import org.bukkit.ChatColor;
+import org.bukkit.Location;
 import org.bukkit.Material;
 import org.bukkit.entity.Player;
 import org.bukkit.event.EventHandler;
 import org.bukkit.event.EventPriority;
 import org.bukkit.event.Listener;
-import org.bukkit.event.player.PlayerInteractAtEntityEvent;
+import org.bukkit.event.player.PlayerInteractEntityEvent;
+import org.bukkit.event.player.PlayerMoveEvent;
 import org.bukkit.event.player.PlayerQuitEvent;
+import org.bukkit.event.player.PlayerToggleSprintEvent;
 import org.bukkit.inventory.ItemStack;
 
+import java.util.HashMap;
+import java.util.UUID;
+
 /**
- * Listens for right-click interactions on players with a lead in hand.
- * Right-clicking a player with a lead will toggle the cuff state.
+ * Listens for right-click interactions on players with a lead in hand,
+ * and blocks movement for cuffed players beyond the leash radius.
  */
 public class CuffListener implements Listener {
 
@@ -25,19 +32,24 @@ public class CuffListener implements Listener {
     }
 
     /**
-     * PlayerInteractAtEntityEvent fires on RIGHT-CLICK (ПКМ) on an entity.
+     * PlayerInteractEntityEvent fires on RIGHT-CLICK (ПКМ) on an entity.
      * This is the event we use to cuff/uncuff players with a lead.
      */
     @EventHandler(priority = EventPriority.HIGH)
-    public void onPlayerInteractAtEntity(PlayerInteractAtEntityEvent event) {
+    public void onPlayerInteractEntity(PlayerInteractEntityEvent event) {
         // Only process if the clicked entity is a player
         if (!(event.getRightClicked() instanceof Player target)) return;
 
         Player captor = event.getPlayer();
 
-        // Check if the captor is holding a lead in their main hand
-        ItemStack itemInHand = captor.getInventory().getItemInMainHand();
-        if (itemInHand.getType() != Material.LEAD) return;
+        // Check if the captor is holding a lead in main hand or off hand
+        ItemStack mainHand = captor.getInventory().getItemInMainHand();
+        ItemStack offHand = captor.getInventory().getItemInOffHand();
+
+        boolean hasLeadMain = mainHand != null && mainHand.getType() == Material.LEAD;
+        boolean hasLeadOff = offHand != null && offHand.getType() == Material.LEAD;
+
+        if (!hasLeadMain && !hasLeadOff) return;
 
         // Check permission
         if (!captor.hasPermission("leadcuffs.use")) {
@@ -88,6 +100,62 @@ public class CuffListener implements Listener {
     }
 
     /**
+     * Block movement when the cuffed player tries to move beyond the leash radius.
+     * This is the key mechanic that makes the cuffs feel solid.
+     */
+    @EventHandler(priority = EventPriority.HIGH)
+    public void onPlayerMove(PlayerMoveEvent event) {
+        Player prisoner = event.getPlayer();
+
+        if (!cuffManager.isCuffed(prisoner.getUniqueId())) return;
+
+        UUID captorId = cuffManager.getCaptor(prisoner.getUniqueId());
+        Player captor = Bukkit.getPlayer(captorId);
+
+        if (captor == null || !captor.isOnline()) {
+            cuffManager.release(prisoner.getUniqueId());
+            return;
+        }
+
+        // Allow looking around (head rotation) but block actual position movement
+        Location from = event.getFrom();
+        Location to = event.getTo();
+        if (to == null) return;
+
+        // If only head rotation changed, allow it
+        if (from.getBlockX() == to.getBlockX() && from.getBlockY() == to.getBlockY() && from.getBlockZ() == to.getBlockZ()) {
+            return;
+        }
+
+        // Check if the player is in the same world as captor
+        if (!prisoner.getWorld().equals(captor.getWorld())) return;
+
+        double currentDistance = from.distance(captor.getLocation());
+        double newDistance = to.distance(captor.getLocation());
+
+        // If the prisoner is trying to move AWAY from the captor beyond the leash radius, cancel it
+        if (newDistance > cuffManager.getLeashRadius() && newDistance > currentDistance) {
+            // Cancel movement but keep head rotation
+            Location blocked = from.clone();
+            blocked.setYaw(to.getYaw());
+            blocked.setPitch(to.getPitch());
+            event.setTo(blocked);
+        }
+    }
+
+    /**
+     * Prevent cuffed players from sprinting.
+     */
+    @EventHandler
+    public void onPlayerToggleSprint(PlayerToggleSprintEvent event) {
+        if (cuffManager.isCuffed(event.getPlayer().getUniqueId())) {
+            if (event.isSprinting()) {
+                event.setCancelled(true);
+            }
+        }
+    }
+
+    /**
      * Release cuffed players when they disconnect.
      * Also release prisoners if their captor disconnects.
      */
@@ -101,11 +169,11 @@ public class CuffListener implements Listener {
         }
 
         // If the leaving player was a captor, release all their prisoners
-        for (var entry : new java.util.HashMap<>(cuffManager.getCuffedPlayers()).entrySet()) {
+        for (var entry : new HashMap<>(cuffManager.getCuffedPlayers()).entrySet()) {
             if (entry.getValue().equals(player.getUniqueId())) {
                 cuffManager.release(entry.getKey());
 
-                Player prisoner = org.bukkit.Bukkit.getPlayer(entry.getKey());
+                Player prisoner = Bukkit.getPlayer(entry.getKey());
                 if (prisoner != null && prisoner.isOnline()) {
                     prisoner.sendMessage(ChatColor.GREEN + "✔ Ваш конвоир вышел. Вы свободны!");
                 }

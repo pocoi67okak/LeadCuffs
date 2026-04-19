@@ -6,6 +6,7 @@ import org.bukkit.Particle;
 import org.bukkit.Sound;
 import org.bukkit.entity.Player;
 import org.bukkit.scheduler.BukkitRunnable;
+import org.bukkit.util.Vector;
 
 import java.util.HashMap;
 import java.util.Map;
@@ -25,11 +26,14 @@ public class CuffManager {
     // cuffed player UUID -> their follow task ID
     private final Map<UUID, Integer> followTasks = new HashMap<>();
 
-    // Maximum distance before teleporting the prisoner closer
-    private static final double MAX_DISTANCE = 5.0;
+    // Max distance the prisoner can be from captor before being pulled
+    private static final double LEASH_RADIUS = 3.5;
 
-    // How close to keep the prisoner behind the captor
-    private static final double FOLLOW_DISTANCE = 2.5;
+    // Distance at which the prisoner gets teleported (too far, e.g. different chunk loaded)
+    private static final double TELEPORT_DISTANCE = 15.0;
+
+    // How far behind the captor to place the prisoner on teleport
+    private static final double BEHIND_DISTANCE = 1.5;
 
     public CuffManager(LeadCuffs plugin) {
         this.plugin = plugin;
@@ -44,14 +48,15 @@ public class CuffManager {
 
         cuffedPlayers.put(targetId, captorId);
 
-        // Disable target's ability to sprint
+        // Disable sprinting and slow down
         target.setSprinting(false);
+        target.setWalkSpeed(0.1f); // Slower than default 0.2
 
         // Visual & audio feedback
         target.getWorld().playSound(target.getLocation(), Sound.BLOCK_CHAIN_PLACE, 1.0f, 0.8f);
         captor.getWorld().playSound(captor.getLocation(), Sound.BLOCK_CHAIN_PLACE, 1.0f, 0.8f);
 
-        // Start the follow task — runs every 2 ticks (100ms)
+        // Start the follow/pull task — runs every tick for smooth pulling
         BukkitRunnable task = new BukkitRunnable() {
             @Override
             public void run() {
@@ -64,46 +69,76 @@ public class CuffManager {
                     return;
                 }
 
-                // If they are in different worlds, teleport prisoner
+                // If in different worlds, teleport prisoner
                 if (!prisoner.getWorld().equals(holder.getWorld())) {
                     prisoner.teleport(holder.getLocation());
                     return;
                 }
 
-                double distance = prisoner.getLocation().distance(holder.getLocation());
+                Location prisonerLoc = prisoner.getLocation();
+                Location holderLoc = holder.getLocation();
+                double distance = prisonerLoc.distance(holderLoc);
 
-                // If prisoner is too far away, pull them back
-                if (distance > MAX_DISTANCE) {
-                    Location holderLoc = holder.getLocation();
-                    // Calculate a position behind the captor
-                    Location behindHolder = holderLoc.clone().add(
-                            holderLoc.getDirection().normalize().multiply(-FOLLOW_DISTANCE)
-                    );
-                    behindHolder.setY(holderLoc.getY());
-
-                    // Preserve the prisoner's look direction
-                    behindHolder.setYaw(prisoner.getLocation().getYaw());
-                    behindHolder.setPitch(prisoner.getLocation().getPitch());
-
-                    prisoner.teleport(behindHolder);
-                    prisoner.getWorld().spawnParticle(Particle.SMOKE, prisoner.getLocation().add(0, 1, 0), 5, 0.2, 0.2, 0.2, 0.01);
-                } else if (distance > MAX_DISTANCE - 1.0) {
-                    // When getting close to the limit, slow them down
-                    prisoner.setWalkSpeed(0.05f); // Very slow
-                } else {
-                    // Normal restricted speed (slower than default 0.2)
-                    prisoner.setWalkSpeed(0.12f);
+                // Emergency teleport if way too far
+                if (distance > TELEPORT_DISTANCE) {
+                    Location behind = getLocationBehind(holder);
+                    behind.setYaw(prisonerLoc.getYaw());
+                    behind.setPitch(prisonerLoc.getPitch());
+                    prisoner.teleport(behind);
+                    return;
                 }
 
-                // Prevent sprinting
+                // If prisoner is beyond leash radius, pull them with velocity
+                if (distance > LEASH_RADIUS) {
+                    Vector direction = holderLoc.toVector().subtract(prisonerLoc.toVector()).normalize();
+                    double pullStrength = Math.min(0.6, (distance - LEASH_RADIUS) * 0.3);
+                    direction.multiply(pullStrength);
+                    // Keep some Y so they don't sink into ground
+                    direction.setY(Math.max(direction.getY(), 0.0));
+                    prisoner.setVelocity(direction);
+                }
+
+                // Prevent sprinting always
                 if (prisoner.isSprinting()) {
                     prisoner.setSprinting(false);
+                }
+
+                // Particle chain effect between prisoner and holder (every 4 ticks)
+                if (Bukkit.getCurrentTick() % 4 == 0) {
+                    spawnChainParticles(prisonerLoc, holderLoc);
                 }
             }
         };
 
-        int taskId = task.runTaskTimer(plugin, 0L, 2L).getTaskId();
+        int taskId = task.runTaskTimer(plugin, 0L, 1L).getTaskId();
         followTasks.put(targetId, taskId);
+    }
+
+    /**
+     * Spawn particles along the line between two locations to simulate a chain.
+     */
+    private void spawnChainParticles(Location from, Location to) {
+        Vector direction = to.toVector().subtract(from.toVector());
+        double length = direction.length();
+        if (length < 1.0) return;
+
+        direction.normalize();
+        // one particle every 0.8 blocks
+        for (double d = 0; d < length; d += 0.8) {
+            Location point = from.clone().add(direction.clone().multiply(d)).add(0, 1.0, 0);
+            from.getWorld().spawnParticle(Particle.CRIT, point, 1, 0.05, 0.05, 0.05, 0);
+        }
+    }
+
+    /**
+     * Get a location behind the player (based on their facing direction).
+     */
+    private Location getLocationBehind(Player player) {
+        Location loc = player.getLocation().clone();
+        Vector behind = loc.getDirection().normalize().multiply(-BEHIND_DISTANCE);
+        loc.add(behind);
+        loc.setY(player.getLocation().getY());
+        return loc;
     }
 
     /**
@@ -150,6 +185,13 @@ public class CuffManager {
      */
     public UUID getCaptor(UUID playerId) {
         return cuffedPlayers.get(playerId);
+    }
+
+    /**
+     * Get the leash radius.
+     */
+    public double getLeashRadius() {
+        return LEASH_RADIUS;
     }
 
     /**
