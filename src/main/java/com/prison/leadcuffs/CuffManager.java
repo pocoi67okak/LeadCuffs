@@ -11,6 +11,7 @@ import org.bukkit.util.Vector;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.UUID;
+import java.util.logging.Logger;
 
 /**
  * Manages cuffed players — tracks who is cuffed to whom,
@@ -19,24 +20,23 @@ import java.util.UUID;
 public class CuffManager {
 
     private final LeadCuffs plugin;
+    private final Logger logger;
 
     // cuffed player UUID -> captor player UUID
     private final Map<UUID, UUID> cuffedPlayers = new HashMap<>();
 
-    // cuffed player UUID -> their follow task ID
-    private final Map<UUID, Integer> followTasks = new HashMap<>();
+    // cuffed player UUID -> their BukkitRunnable task
+    private final Map<UUID, BukkitRunnable> followTasks = new HashMap<>();
 
     // Max distance the prisoner can be from captor before being pulled
-    private static final double LEASH_RADIUS = 3.5;
+    public static final double LEASH_RADIUS = 4.0;
 
-    // Distance at which the prisoner gets teleported (too far, e.g. different chunk loaded)
-    private static final double TELEPORT_DISTANCE = 15.0;
-
-    // How far behind the captor to place the prisoner on teleport
-    private static final double BEHIND_DISTANCE = 1.5;
+    // Distance at which prisoner gets emergency-teleported
+    private static final double TELEPORT_DISTANCE = 10.0;
 
     public CuffManager(LeadCuffs plugin) {
         this.plugin = plugin;
+        this.logger = plugin.getLogger();
     }
 
     /**
@@ -48,124 +48,142 @@ public class CuffManager {
 
         cuffedPlayers.put(targetId, captorId);
 
-        // Disable sprinting and slow down
+        // Slow the prisoner down
         target.setSprinting(false);
-        target.setWalkSpeed(0.1f); // Slower than default 0.2
+        target.setWalkSpeed(0.08f);
 
-        // Visual & audio feedback
+        // Sound feedback
         target.getWorld().playSound(target.getLocation(), Sound.BLOCK_CHAIN_PLACE, 1.0f, 0.8f);
         captor.getWorld().playSound(captor.getLocation(), Sound.BLOCK_CHAIN_PLACE, 1.0f, 0.8f);
 
-        // Start the follow/pull task — runs every tick for smooth pulling
+        logger.info("[LeadCuffs] " + captor.getName() + " cuffed " + target.getName());
+
+        // Repeating task — every 2 ticks: check distance, teleport if needed, spawn particles
         BukkitRunnable task = new BukkitRunnable() {
-            private int tickCounter = 0;
+            private int tick = 0;
 
             @Override
             public void run() {
-                tickCounter++;
+                tick++;
 
                 Player prisoner = Bukkit.getPlayer(targetId);
                 Player holder = Bukkit.getPlayer(captorId);
 
-                // If either player is offline, release
                 if (prisoner == null || holder == null || !prisoner.isOnline() || !holder.isOnline()) {
-                    release(targetId);
+                    releaseSafe(targetId);
+                    this.cancel();
                     return;
                 }
 
-                // If in different worlds, teleport prisoner
+                // Different worlds — just teleport
                 if (!prisoner.getWorld().equals(holder.getWorld())) {
                     prisoner.teleport(holder.getLocation());
                     return;
                 }
 
-                Location prisonerLoc = prisoner.getLocation();
-                Location holderLoc = holder.getLocation();
-                double distance = prisonerLoc.distance(holderLoc);
+                Location pLoc = prisoner.getLocation();
+                Location hLoc = holder.getLocation();
+                double dist = pLoc.distance(hLoc);
 
-                // Emergency teleport if way too far
-                if (distance > TELEPORT_DISTANCE) {
-                    Location behind = getLocationBehind(holder);
-                    behind.setYaw(prisonerLoc.getYaw());
-                    behind.setPitch(prisonerLoc.getPitch());
-                    prisoner.teleport(behind);
+                // If too far — teleport to captor
+                if (dist > TELEPORT_DISTANCE) {
+                    Location dest = hLoc.clone();
+                    // Move 1.5 blocks behind the holder
+                    Vector back = hLoc.getDirection().normalize().multiply(-1.5);
+                    dest.add(back);
+                    dest.setY(hLoc.getY());
+                    dest.setYaw(pLoc.getYaw());
+                    dest.setPitch(pLoc.getPitch());
+                    prisoner.teleport(dest);
                     return;
                 }
 
-                // If prisoner is beyond leash radius, pull them with velocity
-                if (distance > LEASH_RADIUS) {
-                    Vector direction = holderLoc.toVector().subtract(prisonerLoc.toVector()).normalize();
-                    double pullStrength = Math.min(0.6, (distance - LEASH_RADIUS) * 0.3);
-                    direction.multiply(pullStrength);
-                    // Keep some Y so they don't sink into ground
-                    direction.setY(Math.max(direction.getY(), 0.0));
-                    prisoner.setVelocity(direction);
+                // If beyond leash radius — teleport closer
+                if (dist > LEASH_RADIUS) {
+                    // Calculate direction from prisoner to holder
+                    Vector dir = hLoc.toVector().subtract(pLoc.toVector()).normalize();
+                    // Place prisoner at leash radius distance from holder
+                    double moveBy = dist - LEASH_RADIUS + 0.5;
+                    Location dest = pLoc.clone().add(dir.multiply(moveBy));
+                    dest.setYaw(pLoc.getYaw());
+                    dest.setPitch(pLoc.getPitch());
+                    prisoner.teleport(dest);
                 }
 
-                // Prevent sprinting always
+                // Kill sprint
                 if (prisoner.isSprinting()) {
                     prisoner.setSprinting(false);
                 }
 
-                // Particle chain effect between prisoner and holder (every 4 ticks)
-                if (tickCounter % 4 == 0) {
-                    spawnChainParticles(prisonerLoc, holderLoc);
+                // Particle chain every 6 ticks (~300ms)
+                if (tick % 3 == 0) {
+                    drawChain(pLoc, hLoc);
                 }
             }
         };
 
-        int taskId = task.runTaskTimer(plugin, 0L, 1L).getTaskId();
-        followTasks.put(targetId, taskId);
+        task.runTaskTimer(plugin, 1L, 2L);
+        followTasks.put(targetId, task);
     }
 
     /**
-     * Spawn particles along the line between two locations to simulate a chain.
+     * Draw a particle chain between two locations.
      */
-    private void spawnChainParticles(Location from, Location to) {
-        Vector direction = to.toVector().subtract(from.toVector());
-        double length = direction.length();
-        if (length < 1.0) return;
+    private void drawChain(Location from, Location to) {
+        Vector dir = to.toVector().subtract(from.toVector());
+        double len = dir.length();
+        if (len < 0.5) return;
+        dir.normalize();
 
-        direction.normalize();
-        // one particle every 0.8 blocks
-        for (double d = 0; d < length; d += 0.8) {
-            Location point = from.clone().add(direction.clone().multiply(d)).add(0, 1.0, 0);
-            from.getWorld().spawnParticle(Particle.CRIT, point, 1, 0.05, 0.05, 0.05, 0);
+        for (double d = 0; d < len; d += 0.7) {
+            Location point = from.clone().add(dir.clone().multiply(d)).add(0, 1.2, 0);
+            from.getWorld().spawnParticle(Particle.CRIT, point, 1, 0.02, 0.02, 0.02, 0);
         }
     }
 
     /**
-     * Get a location behind the player (based on their facing direction).
+     * Safe release that doesn't cause issues when called from inside the task.
      */
-    private Location getLocationBehind(Player player) {
-        Location loc = player.getLocation().clone();
-        Vector behind = loc.getDirection().normalize().multiply(-BEHIND_DISTANCE);
-        loc.add(behind);
-        loc.setY(player.getLocation().getY());
-        return loc;
+    private void releaseSafe(UUID targetId) {
+        cuffedPlayers.remove(targetId);
+        followTasks.remove(targetId);
+
+        Player prisoner = Bukkit.getPlayer(targetId);
+        if (prisoner != null && prisoner.isOnline()) {
+            prisoner.setWalkSpeed(0.2f);
+            prisoner.getWorld().playSound(prisoner.getLocation(), Sound.BLOCK_CHAIN_BREAK, 1.0f, 1.2f);
+            prisoner.getWorld().spawnParticle(Particle.HAPPY_VILLAGER, prisoner.getLocation().add(0, 1, 0), 10, 0.5, 0.5, 0.5, 0);
+        }
+
+        logger.info("[LeadCuffs] Released prisoner " + targetId);
     }
 
     /**
-     * Release a cuffed player by their UUID.
+     * Release a cuffed player by their UUID (called externally).
      */
     public void release(UUID targetId) {
         if (!cuffedPlayers.containsKey(targetId)) return;
 
+        // Cancel the task
+        BukkitRunnable task = followTasks.remove(targetId);
+        if (task != null) {
+            try {
+                task.cancel();
+            } catch (IllegalStateException ignored) {
+                // Task might not be scheduled yet
+            }
+        }
+
         cuffedPlayers.remove(targetId);
 
-        // Cancel the follow task
-        Integer taskId = followTasks.remove(targetId);
-        if (taskId != null) {
-            Bukkit.getScheduler().cancelTask(taskId);
-        }
-
-        // Restore player state
         Player prisoner = Bukkit.getPlayer(targetId);
         if (prisoner != null && prisoner.isOnline()) {
-            prisoner.setWalkSpeed(0.2f); // Default walk speed
+            prisoner.setWalkSpeed(0.2f);
             prisoner.getWorld().playSound(prisoner.getLocation(), Sound.BLOCK_CHAIN_BREAK, 1.0f, 1.2f);
-            prisoner.getWorld().spawnParticle(Particle.HAPPY_VILLAGER, prisoner.getLocation().add(0, 1, 0), 10, 0.5, 0.5, 0.5, 0.01);
+            prisoner.getWorld().spawnParticle(Particle.HAPPY_VILLAGER, prisoner.getLocation().add(0, 1, 0), 10, 0.5, 0.5, 0.5, 0);
         }
+
+        logger.info("[LeadCuffs] Released prisoner " + targetId);
     }
 
     /**
@@ -177,30 +195,14 @@ public class CuffManager {
         }
     }
 
-    /**
-     * Check if a player is currently cuffed.
-     */
     public boolean isCuffed(UUID playerId) {
         return cuffedPlayers.containsKey(playerId);
     }
 
-    /**
-     * Get the captor UUID for a cuffed player.
-     */
     public UUID getCaptor(UUID playerId) {
         return cuffedPlayers.get(playerId);
     }
 
-    /**
-     * Get the leash radius.
-     */
-    public double getLeashRadius() {
-        return LEASH_RADIUS;
-    }
-
-    /**
-     * Get all cuffed players map.
-     */
     public Map<UUID, UUID> getCuffedPlayers() {
         return cuffedPlayers;
     }

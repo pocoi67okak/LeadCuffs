@@ -8,18 +8,19 @@ import org.bukkit.entity.Player;
 import org.bukkit.event.EventHandler;
 import org.bukkit.event.EventPriority;
 import org.bukkit.event.Listener;
+import org.bukkit.event.entity.EntityDamageByEntityEvent;
 import org.bukkit.event.player.PlayerInteractEntityEvent;
 import org.bukkit.event.player.PlayerMoveEvent;
 import org.bukkit.event.player.PlayerQuitEvent;
 import org.bukkit.event.player.PlayerToggleSprintEvent;
-import org.bukkit.inventory.ItemStack;
+import org.bukkit.inventory.EquipmentSlot;
 
 import java.util.HashMap;
 import java.util.UUID;
 
 /**
- * Listens for right-click interactions on players with a lead in hand,
- * and blocks movement for cuffed players beyond the leash radius.
+ * Listens for right-click (ПКМ) interactions on players with a lead in hand,
+ * blocks movement for cuffed players, and prevents damage to cuffed players from captor.
  */
 public class CuffListener implements Listener {
 
@@ -32,51 +33,37 @@ public class CuffListener implements Listener {
     }
 
     /**
-     * PlayerInteractEntityEvent fires on RIGHT-CLICK (ПКМ) on an entity.
-     * This is the event we use to cuff/uncuff players with a lead.
+     * RIGHT-CLICK (ПКМ) on a player entity while holding a lead.
+     * This event fires for right-clicking on entities.
      */
-    @EventHandler(priority = EventPriority.HIGH)
+    @EventHandler(priority = EventPriority.LOWEST)
     public void onPlayerInteractEntity(PlayerInteractEntityEvent event) {
-        // Only process if the clicked entity is a player
+        // Only handle main hand to avoid firing twice
+        if (event.getHand() != EquipmentSlot.HAND) return;
+
+        // Only players
         if (!(event.getRightClicked() instanceof Player target)) return;
 
         Player captor = event.getPlayer();
+        plugin.getLogger().info("[LeadCuffs] PlayerInteractEntityEvent: " + captor.getName() + " -> " + target.getName()
+                + " | MainHand: " + captor.getInventory().getItemInMainHand().getType());
 
-        // Check if the captor is holding a lead in main hand or off hand
-        ItemStack mainHand = captor.getInventory().getItemInMainHand();
-        ItemStack offHand = captor.getInventory().getItemInOffHand();
+        // Check if holding a lead
+        Material mainHandType = captor.getInventory().getItemInMainHand().getType();
+        if (mainHandType != Material.LEAD) return;
 
-        boolean hasLeadMain = mainHand != null && mainHand.getType() == Material.LEAD;
-        boolean hasLeadOff = offHand != null && offHand.getType() == Material.LEAD;
+        // Cancel default lead behavior FIRST
+        event.setCancelled(true);
 
-        if (!hasLeadMain && !hasLeadOff) return;
-
-        // Check permission
+        // Permission check
         if (!captor.hasPermission("leadcuffs.use")) {
             captor.sendMessage(ChatColor.RED + "У вас нет прав для использования наручников!");
             return;
         }
 
-        // Check if target has bypass permission
+        // Bypass check
         if (target.hasPermission("leadcuffs.bypass")) {
             captor.sendMessage(ChatColor.RED + "Этого игрока нельзя сковать!");
-            return;
-        }
-
-        // Cancel the default interaction (prevents actually leashing)
-        event.setCancelled(true);
-
-        // If the target is already cuffed BY THIS captor, release them
-        if (cuffManager.isCuffed(target.getUniqueId())) {
-            if (cuffManager.getCaptor(target.getUniqueId()).equals(captor.getUniqueId())) {
-                // Release
-                cuffManager.release(target.getUniqueId());
-
-                captor.sendMessage(ChatColor.GREEN + "✔ Вы сняли наручники с " + ChatColor.YELLOW + target.getName());
-                target.sendMessage(ChatColor.GREEN + "✔ " + ChatColor.YELLOW + captor.getName() + ChatColor.GREEN + " снял с вас наручники. Вы свободны!");
-            } else {
-                captor.sendMessage(ChatColor.RED + "Этот игрок скован другим игроком!");
-            }
             return;
         }
 
@@ -86,93 +73,118 @@ public class CuffListener implements Listener {
             return;
         }
 
-        // Can't cuff someone if you're cuffed yourself
+        // If already cuffed by this captor — release
+        if (cuffManager.isCuffed(target.getUniqueId())) {
+            UUID currentCaptor = cuffManager.getCaptor(target.getUniqueId());
+            if (currentCaptor.equals(captor.getUniqueId())) {
+                cuffManager.release(target.getUniqueId());
+                captor.sendMessage(ChatColor.GREEN + "✔ Вы сняли наручники с " + ChatColor.YELLOW + target.getName());
+                target.sendMessage(ChatColor.GREEN + "✔ " + ChatColor.YELLOW + captor.getName() + ChatColor.GREEN + " снял с вас наручники. Вы свободны!");
+                return;
+            } else {
+                captor.sendMessage(ChatColor.RED + "Этот игрок скован другим игроком!");
+                return;
+            }
+        }
+
+        // Can't cuff if you're cuffed
         if (cuffManager.isCuffed(captor.getUniqueId())) {
             captor.sendMessage(ChatColor.RED + "Вы скованы! Сначала освободитесь.");
             return;
         }
 
-        // Cuff the target
+        // --- CUFF ---
         cuffManager.cuff(captor, target);
-
-        captor.sendMessage(ChatColor.GOLD + "⛓ Вы сковали игрока " + ChatColor.YELLOW + target.getName() + ChatColor.GOLD + "! Нажмите ПКМ ещё раз, чтобы снять наручники.");
-        target.sendMessage(ChatColor.RED + "⛓ " + ChatColor.YELLOW + captor.getName() + ChatColor.RED + " сковал вас наручниками! Вы не можете убежать.");
+        captor.sendMessage(ChatColor.GOLD + "⛓ Вы сковали игрока " + ChatColor.YELLOW + target.getName()
+                + ChatColor.GOLD + "! ПКМ по нему ещё раз — снять.");
+        target.sendMessage(ChatColor.RED + "⛓ " + ChatColor.YELLOW + captor.getName()
+                + ChatColor.RED + " сковал вас наручниками! Вы не можете убежать.");
     }
 
     /**
-     * Block movement when the cuffed player tries to move beyond the leash radius.
-     * This is the key mechanic that makes the cuffs feel solid.
+     * BLOCK MOVEMENT — the core restriction.
+     * If the prisoner tries to move AWAY from captor beyond the leash radius, cancel the move.
      */
-    @EventHandler(priority = EventPriority.HIGH)
+    @EventHandler(priority = EventPriority.HIGHEST, ignoreCancelled = true)
     public void onPlayerMove(PlayerMoveEvent event) {
-        Player prisoner = event.getPlayer();
+        Player player = event.getPlayer();
+        UUID playerId = player.getUniqueId();
 
-        if (!cuffManager.isCuffed(prisoner.getUniqueId())) return;
+        if (!cuffManager.isCuffed(playerId)) return;
 
-        UUID captorId = cuffManager.getCaptor(prisoner.getUniqueId());
+        UUID captorId = cuffManager.getCaptor(playerId);
+        if (captorId == null) return;
+
         Player captor = Bukkit.getPlayer(captorId);
-
         if (captor == null || !captor.isOnline()) {
-            cuffManager.release(prisoner.getUniqueId());
+            cuffManager.release(playerId);
             return;
         }
 
-        // Allow looking around (head rotation) but block actual position movement
         Location from = event.getFrom();
         Location to = event.getTo();
         if (to == null) return;
 
-        // If only head rotation changed, allow it
-        if (from.getBlockX() == to.getBlockX() && from.getBlockY() == to.getBlockY() && from.getBlockZ() == to.getBlockZ()) {
+        // Allow pure head rotation (no position change)
+        if (from.getX() == to.getX() && from.getY() == to.getY() && from.getZ() == to.getZ()) {
             return;
         }
 
-        // Check if the player is in the same world as captor
-        if (!prisoner.getWorld().equals(captor.getWorld())) return;
+        // Must be same world
+        if (!player.getWorld().equals(captor.getWorld())) return;
 
-        double currentDistance = from.distance(captor.getLocation());
-        double newDistance = to.distance(captor.getLocation());
+        Location captorLoc = captor.getLocation();
+        double distFrom = from.distance(captorLoc);
+        double distTo = to.distance(captorLoc);
 
-        // If the prisoner is trying to move AWAY from the captor beyond the leash radius, cancel it
-        if (newDistance > cuffManager.getLeashRadius() && newDistance > currentDistance) {
-            // Cancel movement but keep head rotation
-            Location blocked = from.clone();
-            blocked.setYaw(to.getYaw());
-            blocked.setPitch(to.getPitch());
-            event.setTo(blocked);
+        // If already at or beyond radius AND trying to move further away — block
+        if (distTo > CuffManager.LEASH_RADIUS && distTo >= distFrom) {
+            event.setCancelled(true);
         }
     }
 
     /**
-     * Prevent cuffed players from sprinting.
+     * Prevent sprinting while cuffed.
      */
     @EventHandler
-    public void onPlayerToggleSprint(PlayerToggleSprintEvent event) {
-        if (cuffManager.isCuffed(event.getPlayer().getUniqueId())) {
-            if (event.isSprinting()) {
+    public void onSprint(PlayerToggleSprintEvent event) {
+        if (event.isSprinting() && cuffManager.isCuffed(event.getPlayer().getUniqueId())) {
+            event.setCancelled(true);
+        }
+    }
+
+    /**
+     * Prevent cuffed player from being damaged by their captor (no accidental hits).
+     */
+    @EventHandler
+    public void onDamage(EntityDamageByEntityEvent event) {
+        if (!(event.getDamager() instanceof Player damager)) return;
+        if (!(event.getEntity() instanceof Player victim)) return;
+
+        if (cuffManager.isCuffed(victim.getUniqueId())) {
+            UUID captor = cuffManager.getCaptor(victim.getUniqueId());
+            if (captor != null && captor.equals(damager.getUniqueId())) {
                 event.setCancelled(true);
             }
         }
     }
 
     /**
-     * Release cuffed players when they disconnect.
-     * Also release prisoners if their captor disconnects.
+     * Clean up on disconnect — release cuffed prisoners and prisoners of disconnecting captors.
      */
     @EventHandler
-    public void onPlayerQuit(PlayerQuitEvent event) {
-        Player player = event.getPlayer();
+    public void onQuit(PlayerQuitEvent event) {
+        UUID playerId = event.getPlayer().getUniqueId();
 
-        // If the leaving player was cuffed, release them
-        if (cuffManager.isCuffed(player.getUniqueId())) {
-            cuffManager.release(player.getUniqueId());
+        // Release if cuffed
+        if (cuffManager.isCuffed(playerId)) {
+            cuffManager.release(playerId);
         }
 
-        // If the leaving player was a captor, release all their prisoners
+        // Release all prisoners if their captor left
         for (var entry : new HashMap<>(cuffManager.getCuffedPlayers()).entrySet()) {
-            if (entry.getValue().equals(player.getUniqueId())) {
+            if (entry.getValue().equals(playerId)) {
                 cuffManager.release(entry.getKey());
-
                 Player prisoner = Bukkit.getPlayer(entry.getKey());
                 if (prisoner != null && prisoner.isOnline()) {
                     prisoner.sendMessage(ChatColor.GREEN + "✔ Ваш конвоир вышел. Вы свободны!");
