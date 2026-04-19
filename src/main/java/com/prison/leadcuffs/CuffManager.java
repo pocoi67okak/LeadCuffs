@@ -29,7 +29,7 @@ public class CuffManager {
     private final Map<UUID, BukkitRunnable> followTasks = new HashMap<>();
 
     // Max distance the prisoner can be from captor before being pulled
-    public static final double LEASH_RADIUS = 4.0;
+    public static final double LEASH_RADIUS = 1.0;
 
     // Distance at which prisoner gets emergency-teleported
     private static final double TELEPORT_DISTANCE = 10.0;
