@@ -58,8 +58,12 @@ public class CuffManager {
 
         // Start the follow/pull task — runs every tick for smooth pulling
         BukkitRunnable task = new BukkitRunnable() {
+            private int tickCounter = 0;
+
             @Override
             public void run() {
+                tickCounter++;
+
                 Player prisoner = Bukkit.getPlayer(targetId);
                 Player holder = Bukkit.getPlayer(captorId);
 
@@ -104,7 +108,7 @@ public class CuffManager {
                 }
 
                 // Particle chain effect between prisoner and holder (every 4 ticks)
-                if (Bukkit.getCurrentTick() % 4 == 0) {
+                if (tickCounter % 4 == 0) {
                     spawnChainParticles(prisonerLoc, holderLoc);
                 }
             }
