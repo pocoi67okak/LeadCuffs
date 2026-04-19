@@ -1,0 +1,23 @@
+name: LeadCuffs
+version: ${project.version}
+main: com.prison.leadcuffs.LeadCuffs
+api-version: '1.21'
+description: Handcuff players using a lead
+authors: [Prison]
+
+commands:
+  uncuff:
+    description: Release a cuffed player
+    usage: /uncuff <player>
+    permission: leadcuffs.uncuff
+
+permissions:
+  leadcuffs.use:
+    description: Allows using lead to cuff players
+    default: op
+  leadcuffs.uncuff:
+    description: Allows using /uncuff command
+    default: op
+  leadcuffs.bypass:
+    description: Cannot be cuffed
+    default: false
